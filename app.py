@@ -2,6 +2,8 @@ import json
 import os
 import io
 import zipfile
+import tempfile  # ←追加
+import shutil    # ←追加
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
@@ -54,7 +56,7 @@ def convert_to_geojson_and_gdf(data):
 
 
 def process_multiple_hazard_maps(gdf_patients, zip_filepaths, hazard_type):
-    """複数のZIPファイルを順番に読み込み、まとめて判定する"""
+    """複数のZIPファイルを順番に読み込み、まとめて判定する（クラウド対応版）"""
     all_matched_dfs = []
     
     for zip_path in zip_filepaths:
@@ -62,75 +64,84 @@ def process_multiple_hazard_maps(gdf_patients, zip_filepaths, hazard_type):
             continue
             
         try:
-            target_shps = []
-            with zipfile.ZipFile(zip_path, 'r') as z:
-                file_list = z.infolist()
+            # 【重要】クラウドのメモリ不足とLinuxの文字化け対策のため、一時フォルダに解凍して処理する
+            with tempfile.TemporaryDirectory() as tmpdir:
                 
-                # 1. 「想定最大」が含まれるShapefileを【すべて】リストアップする
-                for file_info in file_list:
-                    try:
-                        decoded_name = file_info.filename.encode('cp437').decode('cp932')
-                    except Exception:
-                        decoded_name = file_info.filename
-                        
-                    if decoded_name.endswith('.shp') and ('最大' in decoded_name):
-                        target_shps.append(file_info.filename)
-                
-                # 2. なければ「継続」「倒壊」以外のShapefileを【すべて】リストアップする
-                if not target_shps:
-                    for file_info in file_list:
+                # 1. ZIPファイルの中身を安全に解凍する
+                with zipfile.ZipFile(zip_path, 'r') as z:
+                    for info in z.infolist():
                         try:
-                            decoded_name = file_info.filename.encode('cp437').decode('cp932')
+                            # Windowsの日本語ファイル名をLinuxでも読めるように変換
+                            decoded_name = info.filename.encode('cp437').decode('cp932')
                         except Exception:
-                            decoded_name = file_info.filename
+                            decoded_name = info.filename
+                        
+                        extracted_path = os.path.join(tmpdir, decoded_name)
+                        os.makedirs(os.path.dirname(extracted_path), exist_ok=True)
+                        
+                        # ファイルを書き出す（フォルダの場合はスキップ）
+                        if not info.is_dir():
+                            with z.open(info) as source, open(extracted_path, "wb") as target:
+                                shutil.copyfileobj(source, target)
+                
+                # 2. 解凍したフォルダの中から対象のShapefileを探す
+                target_shps = []
+                for root, dirs, files in os.walk(tmpdir):
+                    for file in files:
+                        if file.endswith('.shp') and '最大' in file:
+                            target_shps.append(os.path.join(root, file))
                             
-                        if decoded_name.endswith('.shp') and ('継続' not in decoded_name) and ('倒壊' not in decoded_name) and ('氾濫' not in decoded_name):
-                            target_shps.append(file_info.filename)
-            
-            if not target_shps:
-                st.warning(f"⚠️ {zip_path} の中に該当する .shp ファイルが見つかりません。")
-                continue
+                # 3. 「最大」がなければそれ以外を探す
+                if not target_shps:
+                    for root, dirs, files in os.walk(tmpdir):
+                        for file in files:
+                            if file.endswith('.shp') and ('継続' not in file) and ('倒壊' not in file) and ('氾濫' not in file):
+                                target_shps.append(os.path.join(root, file))
 
-            # 【重要】ZIP内で見つかった該当のShapefileを「すべて」処理する
-            for shp_filename in target_shps:
-                safe_zip_path = zip_path.replace("\\", "/")
-                read_path = f"zip://{safe_zip_path}!{shp_filename}"
+                if not target_shps:
+                    st.warning(f"⚠️ {zip_path} の中に該当する .shp ファイルが見つかりません。")
+                    continue
 
-                try:
-                    gdf_hazard = gpd.read_file(read_path, encoding="cp932")
-                except Exception:
-                    gdf_hazard = gpd.read_file(read_path, encoding="utf-8")
+                # 4. 見つかったShapefileをすべて読み込んで判定
+                for shp_path in target_shps:
+                    try:
+                        gdf_hazard = gpd.read_file(shp_path, encoding="cp932")
+                    except Exception:
+                        gdf_hazard = gpd.read_file(shp_path, encoding="utf-8")
 
-                if gdf_hazard.crs != "EPSG:4326":
-                    gdf_hazard = gdf_hazard.to_crs("EPSG:4326")
+                    if gdf_hazard.crs != "EPSG:4326":
+                        gdf_hazard = gdf_hazard.to_crs("EPSG:4326")
 
-                # 空間結合（判定）
-                joined_data = gpd.sjoin(gdf_patients, gdf_hazard, how="inner", predicate="intersects")
+                    # 空間結合（判定）
+                    joined_data = gpd.sjoin(gdf_patients, gdf_hazard, how="inner", predicate="intersects")
 
-                # 洪水の 0.5m 以上フィルタリング
-                if hazard_type == "flood" and not joined_data.empty:
-                    # 浸水ランクを示すカラム（A31_205など）を確実に見つける
-                    target_col = None
-                    for col_name in ['A31_205', 'A31_105', 'A31_005', 'A31_05', '浸水ランク', '浸水ランクコード']:
-                        if col_name in joined_data.columns:
-                            target_col = col_name
-                            break
+                    # 洪水の 0.5m 以上フィルタリング
+                    if hazard_type == "flood" and not joined_data.empty:
+                        target_col = None
+                        for col_name in ['A31_205', 'A31_105', 'A31_005', 'A31_05', '浸水ランク', '浸水ランクコード']:
+                            if col_name in joined_data.columns:
+                                target_col = col_name
+                                break
+                        
+                        if not target_col:
+                            fallback_cols = [col for col in joined_data.columns if (col.startswith('A31_') and col.endswith('05')) or 'ランク' in col]
+                            if fallback_cols:
+                                target_col = fallback_cols[0]
+
+                        if target_col:
+                            rank_numeric = pd.to_numeric(joined_data[target_col], errors='coerce')
+                            danger_codes = [2, 3, 4, 5, 6, 12, 13, 14, 15] 
+                            joined_data = joined_data[rank_numeric.isin(danger_codes)]
+
+                    if not joined_data.empty:
+                        # 早めに 'name' だけに絞り込んでメモリを節約
+                        if 'name' in joined_data.columns:
+                            joined_data = joined_data[['name']]
+                        all_matched_dfs.append(joined_data)
                     
-                    if not target_col:
-                        fallback_cols = [col for col in joined_data.columns if (col.startswith('A31_') and col.endswith('05')) or 'ランク' in col]
-                        if fallback_cols:
-                            target_col = fallback_cols[0]
-
-                    if target_col:
-                        # 文字列を数値に変換し、対象のランクコード（0.5m以上）のリストに含まれるか判定
-                        rank_numeric = pd.to_numeric(joined_data[target_col], errors='coerce')
-                        # 2~6(新規格の0.5m以上)、12~15(旧規格の0.5m以上)
-                        danger_codes = [2, 3, 4, 5, 6, 12, 13, 14, 15] 
-                        joined_data = joined_data[rank_numeric.isin(danger_codes)]
-
-                if not joined_data.empty:
-                    all_matched_dfs.append(joined_data)
-
+                    # 1ファイル処理するごとにメモリを強制解放
+                    del gdf_hazard
+                    
         except Exception as e:
             st.warning(f"⚠️ {zip_path} の読み込み中にエラーが発生しました: {e}")
 
@@ -140,11 +151,8 @@ def process_multiple_hazard_maps(gdf_patients, zip_filepaths, hazard_type):
 
     # すべての判定結果を1つの表に合体
     final_df = pd.concat(all_matched_dfs, ignore_index=True)
-    
-    # 重複を削除し、出力するExcelの列を「name」だけにする
     if 'name' in final_df.columns:
         final_df = final_df.drop_duplicates(subset=['name'])
-        final_df = final_df[['name']]
     
     return final_df
 
